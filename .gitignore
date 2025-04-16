@@ -1,0 +1,11 @@
+*.pyc
+*.mp4
+
+.DS_Store
+
+src/comotion_demo/data
+src/comotion_demo.egg-info/
+
+data/
+tmp/
+results/

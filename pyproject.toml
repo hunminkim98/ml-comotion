@@ -1,0 +1,52 @@
+[project]
+name = "comotion_demo"
+description = "CoMotion: Concurrent Multi-person 3D Motion."
+version = "0.1"
+authors = [
+    {name = "Alejandro Newell"},
+    {name = "Peiyun Hu"},
+    {name = "Lahav Lipson"},
+    {name = "Stephan R. Richter"},
+    {name = "Vladlen Koltun"},
+]
+readme = "README.md"
+dependencies = [
+    "click",
+    "coremltools",
+    "einops",
+    "ffmpeg-python",
+    "opencv-python",
+    "pypose",
+    "PyQt6",
+    "ruff",
+    "scenedetect",
+    "tensordict",
+    "timm==1.0.13",
+    "torch==2.5.1",
+    "transformers==4.48.0",
+    "tqdm",
+    "chumpy @ git+https://github.com/mattloper/chumpy@9b045ff5d6588a24a0bab52c83f032e2ba433e17",
+]
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+all = [
+    "aitviewer",
+]
+colab = [
+    "pyrender",
+    "smplx[all]",
+    "more-itertools",
+    "trimesh"
+]
+
+[project.urls]
+Homepage = "https://github.com/apple/ml-comotion"
+Repository = "https://github.com/apple/ml-comotion"
+
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
