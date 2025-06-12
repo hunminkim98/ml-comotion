@@ -139,8 +139,8 @@ def main(
 if __name__ == "__main__":
     # --- Configuration --- 
     # !!! EDIT THESE VALUES BEFORE RUNNING THE SCRIPT !!!
-    pt_file_to_process = "results/Test2.pt"  # Path to the input CoMotion .pt file
-    output_directory = "results/smpl_npz_output" # Directory to save the output .npz files
+    pt_file_to_process = "output/OTN.pt"  # Path to the input CoMotion .pt file
+    output_directory = "output/smpl_npz_output" # Directory to save the output .npz files
     motion_fps = 30.0  # Frame rate of the motion sequence
     model_gender = "neutral"  # Gender of the SMPL model ('male', 'female', 'neutral')
     use_load_weights_only = False # Use weights_only=True when loading .pt file (safer if True)

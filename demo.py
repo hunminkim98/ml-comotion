@@ -83,6 +83,110 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 use_mps = torch.mps.is_available()
 
 
+class SafeSMPLDecoder(torch.nn.Module):
+    """
+    A wrapper for an SMPL decoder that ensures the decoder operates on CPU
+    and that input tensors to its forward method are moved to the CPU.
+    """
+    def __init__(self, smpl_decoder_module: torch.nn.Module):
+        super().__init__()
+        # Ensure this internal decoder is on CPU
+        self.cpu_decoder = smpl_decoder_module.cpu()
+        # Determine the device of the cpu_decoder's parameters (should be CPU)
+        try:
+            self.target_device = next(self.cpu_decoder.parameters()).device
+        except StopIteration: # No parameters
+            found_buffer_device = None
+            for buffer_tensor in self.cpu_decoder.buffers():
+                if isinstance(buffer_tensor, torch.Tensor):
+                    found_buffer_device = buffer_tensor.device
+                    break
+            if found_buffer_device is not None:
+                self.target_device = found_buffer_device
+            else: # Fallback if no params/buffers or they are not tensors
+                self.target_device = torch.device('cpu')
+        # Ensure target_device is CPU, as cpu_decoder is explicitly .cpu()
+        if self.target_device != torch.device('cpu'):
+            logging.warning(f"SafeSMPLDecoder target_device is {self.target_device}, forcing to CPU.")
+            self.target_device = torch.device('cpu')
+
+
+    def forward(self, betas: torch.Tensor, pose: torch.Tensor, trans: torch.Tensor, output_format: str = "joints") -> torch.Tensor:
+        """
+        Forward pass with device synchronization for input tensors.
+        """
+        betas_safe = betas.to(self.target_device)
+        pose_safe = pose.to(self.target_device)
+        trans_safe = trans.to(self.target_device)
+        return self.cpu_decoder(betas_safe, pose_safe, trans_safe, output_format=output_format)
+
+    def __getattr__(self, name: str):
+        """
+        Delegate other attribute/method accesses to the underlying CPU decoder.
+        """
+        if name in ['cpu_decoder', 'target_device']: # Avoid recursion for self attributes
+            # This should not happen if Python's __getattribute__ works as expected first for own attrs
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        return getattr(self.cpu_decoder, name)
+
+
+def save_video_frames(frames_list, output_path, fps, frame_size, logging_prefix="Video"):
+    """Helper function to save a list of frames as a video."""
+    if not frames_list:
+        logging.warning(f"{logging_prefix}: No frames to save for {output_path}.")
+        return
+
+    expected_height, expected_width = frame_size
+    
+    # cv2.VideoWriter expects (width, height)
+    output_width, output_height = expected_width, expected_height 
+
+    # Try multiple codecs for Windows compatibility
+    codecs_to_try = [
+        ('mp4v', 'MP4V'),  # MPEG-4 Part 2 - widely supported
+        ('MJPG', 'MJPG'),  # Motion JPEG - very compatible
+        ('XVID', 'XVID'),  # Xvid MPEG-4 - good quality
+        ('H264', 'H264'),  # H.264 - best quality but may have issues
+    ]
+    
+    out_video = None
+    used_codec = None
+    
+    for codec_fourcc, codec_name in codecs_to_try:
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*codec_fourcc)
+            # Use output_width, output_height for VideoWriter
+            out_video = cv2.VideoWriter(str(output_path), fourcc, float(fps), (output_width, output_height))
+            
+            if out_video.isOpened():
+                used_codec = codec_name
+                logging.info(f"{logging_prefix}: Using {codec_name} codec for video {output_path} ({output_width}x{output_height} @ {fps:.2f} FPS)")
+                break
+            else:
+                # Ensure release even if not opened, to be safe
+                if out_video: out_video.release()
+                out_video = None
+        except Exception as e:
+            logging.warning(f"{logging_prefix}: Failed to initialize {codec_name} codec for {output_path}: {e}")
+            if out_video:
+                out_video.release()
+                out_video = None
+    
+    if out_video and out_video.isOpened():
+        for frame_idx, frame in enumerate(frames_list):
+            # Ensure frame matches output dimensions
+            if frame.shape[0] != output_height or frame.shape[1] != output_width:
+                # logging.debug(f"{logging_prefix}: Resizing frame {frame_idx} from {frame.shape[1]}x{frame.shape[0]} to {output_width}x{output_height} for {output_path}")
+                frame_resized = cv2.resize(frame, (output_width, output_height), interpolation=cv2.INTER_LANCZOS4)
+                out_video.write(frame_resized)
+            else:
+                out_video.write(frame)
+        out_video.release()
+        logging.info(f"{logging_prefix}: Saved video ({output_width}x{output_height}) using {used_codec} to {output_path}")
+    else:
+        logging.error(f"{logging_prefix}: Failed to initialize any video codec for {output_path}. Video not saved.")
+
+
 def euclidean_distance(point1, point2):
     """Calculate Euclidean distance between two 3D points."""
     return torch.norm(point2 - point1, dim=-1)
@@ -350,19 +454,25 @@ def visualize_poses(
         logging.warning("No detections found.")
     else:
         preds = torch.load(cache_path, weights_only=False, map_location="cpu")
-        track_subset = track_utils.query_range(preds, 0, frame_idx - 1)
-        id_lookup = track_subset["id"].max(0)[0]
-        color_ref = helper.color_ref[id_lookup % len(helper.color_ref)]
-        if len(id_lookup) == 1:
-            color_ref = [color_ref]
+        if not preds or not preds.get("id", None): # Handle empty predictions from cache
+            logging.warning(f"No valid predictions found in cache {cache_path} or 'id' key missing. Skipping pose addition.")
+        else:
+            track_subset = track_utils.query_range(preds, 0, frame_idx - 1)
+            if not track_subset or not track_subset.get("id", None): # Check if query_range returns empty or invalid
+                 logging.warning(f"Querying range in predictions for {cache_path} did not yield valid tracks. Skipping pose addition.")
+            else:
+                id_lookup = track_subset["id"].max(0)[0]
+                color_ref = helper.color_ref[id_lookup % len(helper.color_ref)]
+                if len(id_lookup) == 1:
+                    color_ref = [color_ref]
 
-        betas = track_subset["betas"]
-        pose = track_subset["pose"]
-        trans = track_subset["trans"]
+                betas = track_subset["betas"]
+                pose = track_subset["pose"]
+                trans = track_subset["trans"]
 
-        add_pose_to_scene(
-            viewer, smpl_layer, betas, pose, trans, color, alpha, color_ref
-        )
+                add_pose_to_scene(
+                    viewer, smpl_layer, betas, pose, trans, color, alpha, color_ref
+                )
 
     # Save rendered scene
     viewer.save_video(
@@ -435,60 +545,152 @@ def run_detection(input_path, cache_path, skip_visualization=False, model=None, 
 
 
 def track_poses(
-    input_path, cache_path, start_frame, num_frames, frameskip=1, model=None
+    input_path, cache_path, start_frame, num_frames, frameskip=1, model=None,
+    output_2d_frames_list=None, user_height_m=None
 ):
     """Track poses over a video or a directory of images."""
     if model is None:
         model = comotion.CoMotion(use_coreml=use_mps)
     model.to(device).eval()
 
-    detections = []
-    tracks = []
+    # Create the SafeSMPLDecoder instance once for use in this function
+    # model.smpl_decoder is on `device` (e.g. CUDA), SafeSMPLDecoder will use its CPU version.
+    safe_smpl_decoder = SafeSMPLDecoder(model.smpl_decoder)
+
+    smpl_kinematics_model = None
+    previous_scale_factor = None
+    if user_height_m is not None: # Initialize if user_height_m is provided
+        smpl_kinematics_model = smpl_kinematics.SMPLKinematics()
+        if torch.cuda.is_available(): # Use CUDA if available for SMPL model
+            smpl_kinematics_model = smpl_kinematics_model.cuda()
+        else: # Fallback to CPU for SMPL model
+            smpl_kinematics_model = smpl_kinematics_model.cpu()
+        smpl_kinematics_model.eval()
+
+
+    detections_history = []
+    tracks_history = []
+    image_res_for_saving = None # Store image resolution for MOT format saving
 
     initialized = False
-    for image, K in tqdm(
+    processed_frame_count = 0
+    last_K_for_saving = None # Store K for MOT format saving
+
+
+    for image_tensor, K in tqdm(
         dataloading.yield_image_and_K(input_path, start_frame, num_frames, frameskip),
-        desc="Running CoMotion",
+        desc="Running CoMotion & Preparing 2D Video" if output_2d_frames_list is not None else "Running CoMotion",
     ):
         if not initialized:
-            image_res = image.shape[-2:]
+            image_res = image_tensor.shape[-2:]
+            image_res_for_saving = image_res # Store for later use
             model.init_tracks(image_res)
             initialized = True
+        
+        last_K_for_saving = K.cpu() # Store for later, ensure it's on CPU
 
-        detection, track = model(image, K, use_mps=use_mps)
-        detection = {k: v.cpu() for k, v in detection.items()}
-        track = track.cpu()
-        detections.append(detection)
-        tracks.append(track)
+        detection, track = model(image_tensor, K, use_mps=use_mps)
 
-    detections = {k: [d[k] for d in detections] for k in detections[0].keys()}
-    tracks = torch.stack(tracks, 1)
-    tracks = {k: getattr(tracks, k) for k in ["id", "pose", "trans", "betas"]}
+        # Apply height-based depth correction if enabled
+        if user_height_m is not None and smpl_kinematics_model is not None and detection:
+            required_keys = ["betas", "pose", "trans"]
+            if all(key in detection and detection[key] is not None for key in required_keys):
+                # Pass detection directly, it contains tensors on the 'device'
+                detection_corrected, scale_factor = apply_height_based_depth_correction(
+                    detection, user_height_m, smpl_kinematics_model,
+                    previous_scale_factor, smooth_factor=0.8
+                )
+                if scale_factor != 1.0: 
+                    detection = detection_corrected 
+                    previous_scale_factor = scale_factor
+            # else:
+                # logging.debug("Skipping height correction due to missing keys in detection.")
+        
+        detection_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in detection.items()}
+        track_cpu = track.cpu() if isinstance(track, torch.Tensor) else track
+        
+        detections_history.append(detection_cpu)
+        tracks_history.append(track_cpu)
+
+        if output_2d_frames_list is not None:
+            processed_frame = dataloading.convert_tensor_to_image(image_tensor) # HWC, uint8
+            
+            if detection_cpu and "pred_2d" in detection_cpu and detection_cpu["pred_2d"] is not None:
+                pred_2d_tensor = detection_cpu["pred_2d"]
+                # pred_2d_tensor should be on CPU already from detection_cpu
+                # Expected shape from model: (1, num_people, num_keypoints, 2)
+                
+                keypoints_2d_batch = None
+                if pred_2d_tensor.ndim == 4 and pred_2d_tensor.shape[0] == 1: # Batch size 1
+                    keypoints_2d_batch = pred_2d_tensor[0].numpy() # (num_people, num_keypoints, 2)
+                elif pred_2d_tensor.ndim == 3: # Potentially (num_people, num_keypoints, 2)
+                    keypoints_2d_batch = pred_2d_tensor.numpy()
+                
+                if keypoints_2d_batch is not None:
+                    for person_keypoints in keypoints_2d_batch: # Iterate over people
+                        for kp_idx in range(person_keypoints.shape[0]): # Iterate over keypoints
+                            kp = person_keypoints[kp_idx]
+                            if kp.shape[0] == 2: 
+                                x, y = int(kp[0]), int(kp[1])
+                                if 0 <= x < processed_frame.shape[1] and 0 <= y < processed_frame.shape[0]:
+                                    cv2.circle(processed_frame, (x, y), 3, (0, 255, 0), -1)
+            
+            output_2d_frames_list.append(processed_frame.copy())
+        processed_frame_count +=1
+
+    if not detections_history:
+        logging.warning("No detections were made during tracking. Saving empty cache.")
+        torch.save({}, cache_path)
+        return processed_frame_count # Return count even if no detections
+
+    detections_processed = {k: [d[k] for d in detections_history if k in d] for k in detections_history[0].keys()}
+    tracks_stacked = torch.stack(tracks_history, 1)
+    tracks_processed = {k: getattr(tracks_stacked, k) for k in ["id", "pose", "trans", "betas"]}
+
+    # Ensure K for cleanup is on CPU
+    k_for_cleanup = last_K_for_saving if last_K_for_saving is not None else dataloading.get_default_K(image_tensor).cpu()
+
 
     track_ref = track_utils.cleanup_tracks(
-        {"detections": detections, "tracks": tracks},
-        K,
-        model.smpl_decoder.cpu(),
+        {"detections": detections_processed, "tracks": tracks_processed},
+        k_for_cleanup, 
+        safe_smpl_decoder, # Use the safe wrapper
         min_matched_frames=1,
     )
-    if track_ref:
+    if track_ref and track_ref.get("id") is not None and len(track_ref["id"]) > 0 :
         frame_idxs, track_idxs = track_utils.convert_to_idxs(
-            track_ref, tracks["id"][0].squeeze(-1).long()
+            track_ref, tracks_processed["id"][0].squeeze(-1).long()
         )
-        preds = {k: v[0, frame_idxs, track_idxs] for k, v in tracks.items()}
+        preds = {k: v[0, frame_idxs, track_idxs] for k, v in tracks_processed.items()}
         preds["id"] = preds["id"].squeeze(-1).long()
         preds["frame_idx"] = frame_idxs
         torch.save(preds, cache_path)
 
-        # Save bounding box tracks in MOT format
-        bboxes = track_utils.bboxes_from_smpl(
-            model.smpl_decoder,
-            {k: preds[k] for k in ["betas", "pose", "trans"]},
-            image_res,
-            K,
-        )
-        with open(str(cache_path).replace(".pt", ".txt"), "w") as f:
-            f.write(track_utils.convert_to_mot(preds["id"], preds["frame_idx"], bboxes))
+        if image_res_for_saving:
+            # Ensure K for bboxes_from_smpl is on CPU
+            bboxes_k = k_for_cleanup.cpu() # Ensure K is CPU
+            
+            # Ensure preds for bboxes_from_smpl are on CPU
+            # The wrapper handles tensor devices for smpl_decoder.forward,
+            # but it's good practice if bboxes_from_smpl expects CPU inputs generally.
+            preds_for_bboxes_cpu = {
+                k: preds[k].cpu() if isinstance(preds[k], torch.Tensor) else preds[k] 
+                for k in ["betas", "pose", "trans"]
+            }
+
+            bboxes = track_utils.bboxes_from_smpl(
+                safe_smpl_decoder, # Use the safe wrapper
+                preds_for_bboxes_cpu, 
+                image_res_for_saving,
+                bboxes_k,
+            )
+            with open(str(cache_path).replace(".pt", ".txt"), "w") as f:
+                f.write(track_utils.convert_to_mot(preds["id"], preds["frame_idx"], bboxes))
+    else:
+        logging.warning("Track reference is empty or invalid after cleanup. Saving empty cache.")
+        torch.save({}, cache_path)
+    
+    return processed_frame_count
 
 
 @click.command()
@@ -552,7 +754,10 @@ def main(
     cache_path = output_dir / f"{input_name}.pt"
     
     # Define the device here so it's available for all code paths
+    # This global device is used by track_poses and other functions if not overridden.
+    global device 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 
     if webcam:
         logging.info("Using webcam for real-time processing.")
@@ -1306,94 +1511,18 @@ def main(
         # Save 2D visualization video (webcam resolution)
         if session_frames_2d:
             video_2d_path = output_dir / "webcam_session_2d.mp4"
-            height, width, _ = session_frames_2d[0].shape
-            
-            # Try multiple codecs for Windows compatibility
-            codecs_to_try = [
-                ('mp4v', 'MP4V'),  # MPEG-4 Part 2 - widely supported
-                ('MJPG', 'MJPG'),  # Motion JPEG - very compatible
-                ('XVID', 'XVID'),  # Xvid MPEG-4 - good quality
-                ('H264', 'H264'),  # H.264 - best quality but may have issues
-            ]
-            
-            out_2d = None
-            used_codec = None
-            
-            for codec_fourcc, codec_name in codecs_to_try:
-                try:
-                    fourcc = cv2.VideoWriter_fourcc(*codec_fourcc)
-                    out_2d = cv2.VideoWriter(str(video_2d_path), fourcc, final_fps, (width, height))
-                    
-                    # Test if the writer was successfully initialized
-                    if out_2d.isOpened():
-                        used_codec = codec_name
-                        logging.info(f"Using {codec_name} codec for 2D video")
-                        break
-                    else:
-                        out_2d.release()
-                        out_2d = None
-                except Exception as e:
-                    logging.warning(f"Failed to initialize {codec_name} codec: {e}")
-                    if out_2d:
-                        out_2d.release()
-                        out_2d = None
-            
-            if out_2d and out_2d.isOpened():
-                for frame in session_frames_2d:
-                    out_2d.write(frame)
-                out_2d.release()
-                logging.info(f"Saved 2D visualization video ({width}x{height}) using {used_codec} to {video_2d_path}")
-            else:
-                logging.error("Failed to initialize any video codec for 2D video")
+            h_2d, w_2d, _ = session_frames_2d[0].shape
+            # Use the new helper function
+            save_video_frames(session_frames_2d, video_2d_path, final_fps, (h_2d, w_2d), "2D Webcam Video")
+            # logging.info(f"Saved 2D visualization video ({w_2d}x{h_2d}) using {used_codec} to {video_2d_path}") # Old logging
         
         # Save 3D visualization video (720p)
         if session_frames_3d:
             video_3d_path = output_dir / "webcam_session_3d.mp4"
-            # Force 720p resolution for 3D video
-            target_width, target_height = 1280, 720
-            
-            # Try multiple codecs for Windows compatibility
-            codecs_to_try = [
-                ('mp4v', 'MP4V'),  # MPEG-4 Part 2 - widely supported
-                ('MJPG', 'MJPG'),  # Motion JPEG - very compatible
-                ('XVID', 'XVID'),  # Xvid MPEG-4 - good quality
-                ('H264', 'H264'),  # H.264 - best quality but may have issues
-            ]
-            
-            out_3d = None
-            used_codec = None
-            
-            for codec_fourcc, codec_name in codecs_to_try:
-                try:
-                    fourcc = cv2.VideoWriter_fourcc(*codec_fourcc)
-                    out_3d = cv2.VideoWriter(str(video_3d_path), fourcc, final_fps, (target_width, target_height))
-                    
-                    # Test if the writer was successfully initialized
-                    if out_3d.isOpened():
-                        used_codec = codec_name
-                        logging.info(f"Using {codec_name} codec for 3D video")
-                        break
-                    else:
-                        out_3d.release()
-                        out_3d = None
-                except Exception as e:
-                    logging.warning(f"Failed to initialize {codec_name} codec: {e}")
-                    if out_3d:
-                        out_3d.release()
-                        out_3d = None
-            
-            if out_3d and out_3d.isOpened():
-                for frame in session_frames_3d:
-                    # Resize frame to 720p if necessary
-                    if frame.shape[:2] != (target_height, target_width):
-                        frame_resized = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
-                        out_3d.write(frame_resized)
-                    else:
-                        out_3d.write(frame)
-                out_3d.release()
-                logging.info(f"Saved 3D visualization video (1280x720) using {used_codec} to {video_3d_path}")
-            else:
-                logging.error("Failed to initialize any video codec for 3D video")
+            target_height, target_width = 720, 1280 # 3D video is fixed to 720p
+            # Use the new helper function
+            save_video_frames(session_frames_3d, video_3d_path, final_fps, (target_height, target_width), "3D Webcam Video")
+            # logging.info(f"Saved 3D visualization video ({target_width}x{target_height}) using {used_codec} to {video_3d_path}") # Old logging
         
         # Save session summary
         summary_path = output_dir / "webcam_session_summary.txt"
@@ -1426,12 +1555,48 @@ def main(
         run_detection(input_path, cache_path, skip_visualization, user_height_m=user_height)
     else:
         # Run unrolled tracking on a full video
-        track_poses(input_path, cache_path, start_frame, num_frames, frameskip)
+        video_session_frames_2d = []
+        
+        video_fps = 30.0 # Default FPS
+        if dataloading.is_a_video(input_path):
+            try:
+                video_fps = float(dataloading.get_input_video_fps(input_path))
+                logging.info(f"Input video FPS: {video_fps} for 2D/3D video saving.")
+            except Exception as e:
+                logging.warning(f"Could not get FPS from input video: {e}. Using default {video_fps} FPS.")
+
+        num_actual_processed_frames = track_poses(
+            input_path, 
+            cache_path, 
+            start_frame, 
+            num_frames, 
+            frameskip,
+            output_2d_frames_list=video_session_frames_2d,
+            user_height_m=user_height 
+        )
+
+        if video_session_frames_2d:
+            video_2d_path = output_dir / f"{input_name}_2d.mp4"
+            if num_actual_processed_frames > 0 and video_session_frames_2d:
+                h_2d, w_2d, _ = video_session_frames_2d[0].shape
+                # Use input video's FPS for the 2D video
+                save_video_frames(video_session_frames_2d, video_2d_path, video_fps, (h_2d, w_2d), "2D Video (File Input)")
+            else:
+                logging.info("No 2D frames generated or processed for video input, 2D video not saved.")
+        else:
+            logging.info("No 2D frames were generated for video input.")
+
         if not skip_visualization:
-            video_path = output_dir / f"{input_name}.mp4"
+            # This is the 3D video using AITViewer
+            video_3d_aitviewer_path = output_dir / f"{input_name}_3d_aitviewer.mp4" 
+            logging.info(f"Preparing 3D AITViewer visualization: {video_3d_aitviewer_path}")
+            # Pass the original video_fps to visualize_poses for its output video
             visualize_poses(
-                input_path, cache_path, video_path, start_frame, num_frames, frameskip
+                input_path, cache_path, video_3d_aitviewer_path, start_frame, num_frames, frameskip,
+                fps=video_fps 
             )
+        else:
+            logging.info("Skipping 3D (AITViewer) visualization as requested.")
 
 
 if __name__ == "__main__":

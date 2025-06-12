@@ -1,3 +1,4 @@
+print("DEBUG: dataloading.py is being loaded START")
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.
 import logging
 from pathlib import Path
@@ -13,7 +14,7 @@ from torchvision import transforms
 IMG_MEAN = torch.tensor([0.4850, 0.4560, 0.4060]).view(-1, 1, 1)
 IMG_STD = torch.tensor([0.2290, 0.2240, 0.2250]).view(-1, 1, 1)
 INTERNAL_RESOLUTION = (512, 512)
-VIDEO_EXTENSIONS = {".mp4"}
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
@@ -176,7 +177,7 @@ def yield_image_from_video(
 
 
 def is_a_video(input_path: Path):
-    return input_path.suffix in VIDEO_EXTENSIONS
+    return input_path.suffix.lower() in VIDEO_EXTENSIONS
 
 
 def get_input_video_fps(input_path: Path) -> float:
@@ -198,11 +199,22 @@ def yield_image(
     frameskip: int = 1,
 ) -> Generator[NDArray[np.uint8], None, None]:
     """Generate the next frame from either a video or a directory."""
-    if is_a_video(input_path):
+    # ---- START DEBUGGING ----
+    print(f"DEBUG: yield_image called with input_path: {input_path} (type: {type(input_path)})")
+    print(f"DEBUG: input_path.suffix: '{input_path.suffix}'")
+    suffix_lower = input_path.suffix.lower()
+    print(f"DEBUG: input_path.suffix.lower(): '{suffix_lower}'")
+    print(f"DEBUG: VIDEO_EXTENSIONS: {VIDEO_EXTENSIONS}")
+    is_video_result = is_a_video(input_path)
+    print(f"DEBUG: is_a_video(input_path) returned: {is_video_result}")
+    is_dir_result = input_path.is_dir()
+    print(f"DEBUG: input_path.is_dir() returned: {is_dir_result}")
+    # ---- END DEBUGGING ----
+    if is_video_result: # Use the stored result
         yield from yield_image_from_video(
             input_path, start_frame, num_frames, frameskip
         )
-    elif input_path.is_dir():
+    elif is_dir_result: # Use the stored result
         yield from yield_image_from_directory(
             input_path, start_frame, num_frames, frameskip
         )
@@ -225,6 +237,7 @@ def yield_image_and_K(
     frameskip: int = 1,
 ) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
     """Generate image and the intrinsic matrix."""
+    print(f"DEBUG: yield_image_and_K called with input_path: {input_path}")
     for image in yield_image(input_path, start_frame, num_frames, frameskip):
         image = convert_image_to_tensor(image)
         K = get_default_K(image)
@@ -264,3 +277,5 @@ def prepare_network_inputs(
     cropped_K = cropped_K[None].to(device)
 
     return cropped_image, cropped_K
+
+print("DEBUG: dataloading.py is being loaded END")

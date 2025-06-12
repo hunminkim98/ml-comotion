@@ -3,8 +3,8 @@ from pathlib import Path
 import re
 
 # --- User Configuration ---
-INPUT_DIR = "results/trc"  # Directory containing input TRC files
-OUTPUT_DIR = "results/trc_processed" # Directory to save processed TRC files
+INPUT_DIR = "output/trc"  # Directory containing input TRC files
+OUTPUT_DIR = "output/trc_processed" # Directory to save processed TRC files
 
 # Processing options
 APPLY_Y_FLIP = True  # True to flip the Y-axis (marker_coord_Y *= -1)
